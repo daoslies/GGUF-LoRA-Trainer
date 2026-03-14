@@ -1,0 +1,3 @@
+# Example config for GGUF-LoRA Trainer
+# Copy this file to config.yaml and edit the paths as needed.
+model_path: /path/to/your/model.gguf

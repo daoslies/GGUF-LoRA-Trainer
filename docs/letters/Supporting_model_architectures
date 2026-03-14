@@ -1,0 +1,176 @@
+
+gguf-lora
+Architecture Update: Modular Design for Multi-Architecture Support
+Implementation Team — Internal Memo
+
+Why This Letter Exists
+Since the initial onboarding document was written, we've done hands-on investigation with three real GGUF models. That investigation revealed something important: the assumption that naming.py would be a single flat lookup table is wrong, and acting on that assumption would produce a codebase that becomes a maintenance burden as soon as a second architecture is added.
+This letter explains what we found, what the right design is, and exactly what needs to change before loader.py is written. The core functionality hasn't changed — but the structure of naming.py and the filesystem around it has.
+
+What the Model Dumps Taught Us
+Three models, three different structures
+We dumped tensor names from three GGUFs. The differences were instructive:
+
+Model
+What we found
+Qwen3.5-9B (hybrid)
+Two distinct block types alternating every 4 layers. SSM blocks have fused attn_qkv and DeltaNet state-space tensors (ssm_alpha, ssm_beta, ssm_out, ssm_conv1d). Standard attention blocks appear only at blk.3, 7, 11... etc. Requires two separate name maps and a block-type routing function.
+Qwen3-4B Q8_0
+Pure transformer, 36 identical blocks, split Q/K/V, 100% Q8_0. Clean, uniform, no surprises. This is the v0.1 target.
+GPT-OSS-20B Q4_K_M
+Mixed quant types throughout. Not Q8_0. Deferred to v0.2 once quant support is extended.
+
+The Qwen3.5 hybrid in particular made it clear: if you hardcode a flat dict in naming.py, adding a second architecture means editing core code. That's the wrong design. Each new architecture should be an isolated, addable file — no changes to core required.
+
+The Design Change: Architecture Registry
+What changes in the filesystem
+One new subdirectory. Everything else stays the same.
+
+gguf_lora/
+├── __init__.py
+├── quant.py
+├── naming.py          ← registry logic + auto-detect (replaces flat dict)
+├── architectures/     ← NEW
+│   ├── __init__.py
+│   └── qwen3.py       ← v0.1 target
+├── lora.py
+├── loader.py
+└── writer.py
+
+That's the only structural change. Six core files remain six core files. The architectures/ subdirectory is where all per-model knowledge lives, isolated from the pipeline logic.
+
+What naming.py now does
+naming.py no longer contains any tensor name data. It contains two things only: the registry, and the auto-detection logic that reads the architecture string from the GGUF metadata and routes to the correct map.
+
+# gguf_lora/naming.py
+
+from gguf_lora.architectures.qwen3 import Qwen3NameMap
+
+ARCHITECTURE_REGISTRY = {
+    "qwen3": Qwen3NameMap,
+    # "qwen35": Qwen35NameMap,   # v0.2
+    # "llama": LlamaNameMap,     # v0.2
+}
+
+def get_name_map(gguf_path: str):
+    arch = read_gguf_architecture(gguf_path)  # reads metadata key "general.architecture"
+    if arch not in ARCHITECTURE_REGISTRY:
+        raise NotImplementedError(
+            f"Architecture not supported. "
+            f"Supported: {list(ARCHITECTURE_REGISTRY.keys())}. "
+            f"See CONTRIBUTING.md to add support."
+        )
+    return ARCHITECTURE_REGISTRY[arch]()
+
+The GGUF metadata already contains the architecture string — llama.cpp writes it at conversion time under the key general.architecture. No user input required. Load the file, read the key, get the right map automatically.
+
+What an architecture file looks like
+Each architecture file is self-contained. It knows everything about that model family and nothing about anything else. Here is the complete qwen3.py:
+
+# gguf_lora/architectures/qwen3.py
+
+ARCHITECTURE_ID = 'qwen3'
+NUM_LAYERS = 36
+
+# Q8_0 tensors — valid LoRA targets
+QUANTIZED_TENSORS = {
+    "blk.{i}.attn_q.weight":      "model.layers.{i}.self_attn.q_proj.weight",
+    "blk.{i}.attn_k.weight":      "model.layers.{i}.self_attn.k_proj.weight",
+    "blk.{i}.attn_v.weight":      "model.layers.{i}.self_attn.v_proj.weight",
+    "blk.{i}.attn_output.weight": "model.layers.{i}.self_attn.o_proj.weight",
+    "blk.{i}.ffn_gate.weight":    "model.layers.{i}.mlp.gate_proj.weight",
+    "blk.{i}.ffn_up.weight":      "model.layers.{i}.mlp.up_proj.weight",
+    "blk.{i}.ffn_down.weight":    "model.layers.{i}.mlp.down_proj.weight",
+}
+
+# F32 tensors — plain nn.Parameters, never LoRA targets
+UNQUANTIZED_TENSORS = {
+    "blk.{i}.attn_norm.weight":   "model.layers.{i}.input_layernorm.weight",
+    "blk.{i}.ffn_norm.weight":    "model.layers.{i}.post_feedforward_layernorm.weight",
+    "blk.{i}.attn_q_norm.weight": "model.layers.{i}.self_attn.q_norm.weight",
+    "blk.{i}.attn_k_norm.weight": "model.layers.{i}.self_attn.k_norm.weight",
+}
+
+TOP_LEVEL = {
+    "output_norm.weight": "model.norm.weight",
+    "token_embd.weight":  "model.embed_tokens.weight",
+}
+
+DEFAULT_TARGET_MODULES = [
+    "q_proj", "k_proj", "v_proj", "o_proj",
+    "gate_proj", "up_proj",
+]
+
+That file contains everything loader.py and lora.py need to know about Qwen3. Nothing about Qwen3 lives anywhere else.
+
+Why This Matters: The Contribution Story
+The registry design directly enables the open source contribution model we want. When someone wants to add a new architecture, the contribution is completely bounded:
+
+    • [object Object] Create 
+    • Register it in the ARCHITECTURE_REGISTRY dict in naming.py (one line)
+    • [object Object] Add 
+    • Open a PR
+
+No core files modified except one line in the registry. No risk of breaking existing architectures. That's a contribution someone can make in an afternoon against a model they already have — the kind of PR that actually gets opened.
+
+Contrast with the flat dict approach
+If naming.py were a single flat dict, adding Phi-3 would mean editing the core file directly.
+That creates merge conflicts, risk of breaking Qwen3 support, and no clear ownership boundary.
+The registry pattern eliminates all of that.
+
+One Technical Detail: GQA Shapes
+The tensor dump confirmed Qwen3-4B uses Grouped Query Attention. The shapes tell the story:
+
+Tensor
+Shape — what it means
+attn_q.weight
+[2560, 4096] — full query heads
+attn_k.weight
+[2560, 1024] — fewer key heads (GQA)
+attn_v.weight
+[2560, 1024] — fewer value heads (GQA)
+attn_output.weight
+[4096, 2560] — projects back to hidden dim
+
+This doesn't change the name map or the LoRA injection logic — PEFT handles GQA shapes correctly. But it means the LoRA matrices for K and V will be smaller than for Q, which is correct and expected. Don't be alarmed when you see it.
+
+Immediate Actions for the Team
+What to build, in order
+
+Step
+Action
+1
+Create gguf_lora/architectures/__init__.py — empty file, just marks the package
+2
+Create gguf_lora/architectures/qwen3.py — use the exact template above
+3
+Refactor naming.py — registry + auto-detect, no tensor data
+4
+Update tests/test_naming.py — test registry routing AND tensor map completeness against the real GGUF file
+5
+Proceed to loader.py — it now calls get_name_map(gguf_path) to get the right map automatically
+
+The test to add to test_naming.py
+
+def test_registry_routes_qwen3_correctly():
+    name_map = get_name_map("qwen3-4b-q8_0.gguf")
+    assert name_map.ARCHITECTURE_ID == 'qwen3'
+
+def test_unsupported_architecture_raises():
+    with pytest.raises(NotImplementedError):
+        get_name_map("some_unknown_arch.gguf")
+
+def test_no_unmapped_tensors_in_real_file():
+    from gguf import GGUFReader
+    reader = GGUFReader("qwen3-4b-q8_0.gguf")
+    name_map = get_name_map("qwen3-4b-q8_0.gguf")
+    unmapped = [
+        t.name for t in reader.tensors
+        if name_map.gguf_to_hf(t.name) is None
+    ]
+    assert unmapped == [], f"Unmapped tensors: {unmapped}"
+
+The principle behind this change
+We investigated three real models before writing any production code. Each one revealed something the design needed to handle. That's the right order of operations — look at real data, then design, then build.
+The registry pattern costs almost nothing in complexity — one extra directory, one extra file — and it pays back immediately the moment a second architecture is added. Build it right once. The Qwen3-4B is a clean first case. Do it properly for that one and every architecture after it is free.
+The registry pattern costs almost nothing in complexity — one extra directory, one extra file — and it pays back immediately the moment a second architecture is added. Build it right once. The Qwen3-4B is a clean first case. Do it properly for that one and every architecture after it is free.
