@@ -1,0 +1,5 @@
+torch
+transformers
+gguf
+numpy<2
+pyyaml
