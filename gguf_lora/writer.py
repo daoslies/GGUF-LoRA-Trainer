@@ -30,8 +30,8 @@ def save_lora_gguf(modules, name_map, output_path, alpha, arch_id):
         lora_a = module.lora_A.detach().cpu().float()  # [rank, in_features] (but actually [rank, out_features] in your code)
         lora_b = module.lora_B.detach().cpu().float()  # [out_features, rank] (but actually [in_features, rank] in your code)
         # Transpose both to match GGUF/llama.cpp convention
-        writer.add_tensor(gguf_name + ".lora_a", lora_b.T.contiguous().numpy())  # [out_features, rank]
-        writer.add_tensor(gguf_name + ".lora_b", lora_a.T.contiguous().numpy())  # [rank, in_features]
+        writer.add_tensor(gguf_name + ".lora_a", lora_a.contiguous().numpy())  # [in_features, rank]
+        writer.add_tensor(gguf_name + ".lora_b", lora_b.contiguous().numpy())    # [out_features, rank]
 
     writer.write_header_to_file()
     writer.write_kv_data_to_file()

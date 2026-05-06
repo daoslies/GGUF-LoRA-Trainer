@@ -40,6 +40,82 @@
 - Next: implement train.py (CLI entry point for LoRA training) and writer.py (GGUF LoRA output), following the onboarding and architecture memos.
 - Will document known limitations and supported quant types in README.md after CLI and writer are complete.
 
+## 2026-03-20
+
+### Qwen3 GGUF LoRA Trainer: Device, Precision, and Performance Notes
+
+- **Device Handling:**
+  - All model weights, LoRA parameters, and input tensors are moved to the correct device (CPU or CUDA) before training.
+  - `LazyGGUFLinear` dequantizes weights on-the-fly and ensures they are on the same device as the input tensor.
+
+- **Precision:**
+  - GGUF weights are stored quantized (Q8_0) and only dequantized to float32 for the current layer during forward pass.
+  - LoRA weights are float32 by default; activations use mixed precision (float16) on CUDA via autocast.
+
+- **Performance:**
+  - Step time: ~2.5-5.5s/step (GPU), ~6.8-7.5s/step (CPU) for Qwen3-4B Q8_0.
+  - GPU is ~2x faster than CPU, but per-step dequantization is CPU-bound and limits speedup.
+
+- **VRAM Usage:**
+  - Only the current layer's weights are in float32 at any time; rest remain quantized in RAM.
+  - VRAM logging is included after model init, forward, and backward for profiling.
+
+- **Recommendations:**
+  - For further speedup, consider custom CUDA quantized matmul kernels (like llama.cpp/bitsandbytes).
+  - Sequence length and batch size can be tuned for memory/performance tradeoff.
+
+## 2026-03-20 (continued)
+
+### Reference Architecture & Lessons from Qwen3 Architects
+
+- **Full Transformer Forward:**
+  - Includes RMSNorm (pre/post), multi-head self-attention (q_proj, k_proj, v_proj, o_proj), per-head QK RMSNorm (Qwen3-specific), rotary embeddings (RoPE, base 1,000,000.0), grouped query attention, MLP (gate_proj, up_proj, down_proj, SwiGLU), residuals, and weight tying (embed_tokens/lm_head).
+- **Critical Quirks:**
+  - QK norms are essential for correct attention (not present in Llama/Mistral).
+  - RoPE base must be 1,000,000.0 for Qwen3.
+  - Weight tying: lm_head and embed_tokens must share weights.
+- **Config Extraction:**
+  - All config values (hidden size, head count, etc.) are extracted from GGUF fields, not hardcoded.
+- **Minimal Forward Passes are Insufficient:**
+  - Early versions only applied q_proj in sequence, which led to shape mismatches and did not reflect the real architecture.
+- **Debugging & Profiling:**
+  - VRAM logging and per-step timing included for profiling.
+  - Tokenizer and embedding matrix alignment is critical to avoid OOV errors.
+
 ---
 
-(Continue to log all major steps, decisions, and issues here as the project progresses.)
+# GGUF-LoRA-Trainer: Implementation Status and Known Issues
+
+## Current Status
+- Loader, LoRA injection, and minimal training loop are implemented and tested for Qwen3 GGUF models.
+- Tokenizer now extracts vocab and merges from GGUF fields using only indices in `field.data`, ensuring vocab size matches embedding size.
+- Training loop concatenates prompt and response for next-token prediction, as per best practices.
+- LoRA parameter registration and optimizer setup are correct; only LoRA params are trainable.
+- Forward pass and loss computation are correct for the minimal transformer block.
+
+## Known Issues / Next Steps
+- **Tokenizer/Embedding Alignment:**
+  - After fixing vocab extraction, rare OOV errors persist (e.g., `IndexError: Target 7274 is out of bounds`).
+  - This suggests a possible mismatch between tokenizer vocab and embedding matrix, or an issue with merges/special tokens.
+  - Next step: Print and compare vocab size, embedding size, and sample tokens to confirm alignment.
+- **Loss Masking:**
+  - Currently, loss is computed over the entire prompt+response. For SFT/chat tuning, consider masking loss to only the assistant's response.
+- **Chat Template:**
+  - The Qwen3 chat template is not yet applied; currently, only user/assistant messages are concatenated.
+- **Batching:**
+  - Only single-example batches are supported. Token-based batching and padding are not yet implemented.
+- **Full Model Stack:**
+  - Only a minimal transformer block is used for forward pass. Full stack and attention math are not yet implemented.
+- **Robustness:**
+  - OOV skipping logic has been removed; if OOV errors recur, further tokenizer/model alignment is needed.
+
+## Recommendations
+- Before further training, confirm tokenizer and embedding matrix are fully aligned.
+- Add debug prints for vocab/embedding size and sample tokens if OOV errors persist.
+- Implement chat template and batching as next priorities.
+- Document any further architectural decisions in this file.
+
+---
+
+_Last updated: 2026-03-29_
+_Last updated: 2026-03-19_

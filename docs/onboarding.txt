@@ -1,0 +1,191 @@
+
+gguf-lora
+Implementation Team Onboarding
+Confidential — Internal Use Only
+
+Welcome to the Team
+This document is your complete reference for the gguf-lora project. It covers the problem we're solving, the architecture, the code you'll write, the tests you must pass, and the pitfalls to anticipate. Read it in full before writing a single line.
+
+The one-line pitch
+A minimal Python library that trains LoRA adapters directly on GGUF models — without converting them to HuggingFace format first — and outputs a GGUF LoRA that llama.cpp can run immediately.
+
+Why This Project Exists
+GGUF is an inference-only format. Every existing training pipeline — HuggingFace PEFT, Axolotl, Unsloth — requires you to start from a full-precision or bitsandbytes-quantized HF model. If you have a GGUF you want to fine-tune, you have no clean tooling.
+The gap is real and confirmed. A developer called woct0rdho has a rough proof of concept aiming at a HuggingFace Transformers PR (issue #40070), but it is not shipped, not documented, and not a standalone tool. HuggingFace's own GGUF loader dequantizes everything upfront, defeating the VRAM benefit entirely.
+We are building the clean, minimal, standalone version of this — with good docs, a clear API, and a path toward upstreaming into Transformers as a proper GGUFQuantizer class sitting alongside BitsAndBytesQuantizer.
+
+Scope: What v0.1 Is and Is Not
+In scope
+    • Q8_0 quantisation only — the simplest quant, cleanest dequant math, least round-trip error
+    • Llama and Mistral architectures only — do not generalise prematurely
+    • Path B training: dequant on forward pass → train LoRA → requantize on save
+    • Output: a GGUF LoRA file loadable directly by llama.cpp via --lora
+    • One CLI entry point: python train.py with four arguments
+
+Explicitly out of scope for v0.1
+    • Q4_K_M, Q6_K, or any K-quant — superblock math is complex, tackle later
+    • Path A (quantization-aware training / straight-through estimator) — academically interesting, do it after Path B ships
+    • Schedulers, wandb logging, mixed precision training loop
+    • Multi-architecture support beyond Llama/Mistral
+    • Any GUI, web UI, or notebook interface
+
+Repository Structure
+Six source files. No utils/, no configs/, no notebooks/. If a seventh module appears, stop and ask whether it belongs in one of the existing six.
+
+gguf-lora/
+├── gguf_lora/
+│   ├── __init__.py
+│   ├── quant.py       # dequantize routines — the foundation
+│   ├── naming.py      # GGUF ↔ HF tensor name mapping
+│   ├── lora.py        # LoRAGGUFLinear module + inject_lora()
+│   ├── loader.py      # parse GGUF, assemble model
+│   └── writer.py      # save LoRA tensors to GGUF format
+├── tests/
+│   ├── test_grad_flow.py
+│   ├── test_quant.py
+│   └── test_naming.py
+├── train.py           # CLI entry point
+├── requirements.txt
+├── README.md
+└── pyproject.toml
+
+Architecture: How the Stack Fits Together
+We are a thin layer between the GGUF format and the HuggingFace/PEFT training ecosystem. We do not replace any of the packages below — we connect them.
+
+llama.cpp
+Source of truth for GGUF format spec and quant math. Our output must be consumable by it. Read llama-lora.cpp before writing writer.py.
+transformers
+We borrow model layer structure. Long-term upstream target — our GGUFQuantizer belongs here.
+PEFT
+We reuse the LoRA injection pattern. It does not care where base weights come from.
+PyTorch
+Autograd, optimizer, everything else. Dequant must produce plain torch tensors so autograd has no surprises.
+
+The Six Files: Responsibilities and Key Details
+quant.py — the foundation
+The lowest level. Dequantizes raw bytes into a usable float tensor. For Q8_0: each block is 32 int8 values plus one fp16 scale. The output must be a plain torch.float32 or torch.float16 tensor — no subclasses, no custom types. Autograd depends on this.
+Do not use .numpy() anywhere in the dequant path. Numpy arrays are detached from the autograd graph. Use pure torch operations throughout.
+Put a hard NotImplementedError on any quant type other than Q8_0 with a clear message pointing the user toward using a Q8_0 model.
+naming.py — the most annoying file
+A lookup table, nothing more. GGUF uses llama.cpp naming (blk.{i}.attn_q.weight), HuggingFace uses its own (model.layers.{i}.self_attn.q_proj.weight). There is no formula — it is a hand-built map per architecture. Support Llama/Mistral only. A wrong mapping produces a silently broken model that trains without erroring but learns nothing.
+lora.py — the core module
+Two things live here. LazyGGUFLinear: a frozen linear layer whose weights live as quantized bytes and are dequantized on each forward pass. LoRAGGUFLinear: extends it with lora_A and lora_B as the only nn.Parameters with requires_grad=True. inject_lora() walks the model and swaps eligible layers using a target_modules filter.
+lora_A should be initialised with small random values (~0.02 std). lora_B should be initialised to zero. This ensures the LoRA contributes nothing at the start of training, which is the standard and correct initialisation.
+loader.py — assembles the model
+Parses the GGUF binary: header, metadata, tensor index. Constructs the model by mapping tensors to layers via naming.py. Critically: not every tensor in a GGUF is quantized. Norms, biases, and embeddings are typically stored as plain fp32. The loader must detect quant type per tensor and handle them as regular nn.Parameters rather than LazyGGUFLinear.
+writer.py — outputs the GGUF LoRA
+Walks the trained model, extracts lora_A and lora_B, converts names back to GGUF convention, and writes a valid GGUF file. Read llama-lora.cpp in the llama.cpp source before writing this file. The metadata must include lora.r and lora.alpha per layer. An incorrect output loads silently but does nothing at inference time.
+train.py — the entry point
+As thin as possible. Parses four arguments: --model, --data, --rank, --output. Assembles the pipeline, runs the loop, saves. Before the loop starts, assert that the number of trainable parameters matches only lora_A and lora_B matrices — this catches accidental requires_grad leaks before they OOM your machine.
+
+Target CLI
+python train.py --model my_model.gguf --data data.jsonl --rank 8 --output lora_out.gguf  That command should work. That is the definition of shipped.
+
+Tests: What to Write and Why Each One Matters
+test_grad_flow.py — write this first, before anything else
+The existential test. If gradients do not flow correctly through a dequantized weight, nothing works and the project is broken at the foundation. This is the first thing you run on a new machine and the first thing you run after changing quant.py.
+    • Assert lora_A.grad is not None after backward()
+    • Assert lora_B.grad is not None after backward()
+    • Assert that exactly 2 tensors have requires_grad=True (only the LoRA matrices)
+    • Assert that quantized_data is not in model.parameters()
+
+test_quant.py — validates your dequant math
+Dequantize, requantize, dequantize again. The round-trip error for Q8_0 should be very small — Q8_0 is close to fp32 precision. If it is not, your dequant implementation is wrong and everything trained on top of it is garbage. Also assert that the output tensor type is exactly torch.Tensor with no subclasses.
+test_naming.py — validates the name map
+Verify every entry in LLAMA_NAME_MAP maps a known GGUF tensor name to a known HF tensor name. Then run against a real GGUF file and assert zero unmapped tensors. Silent failures here — layers loading into wrong positions — are the hardest bugs to diagnose during training.
+
+Pitfalls to Anticipate
+Severity
+Pitfall
+Description
+Mitigation
+🔴 High
+Gradient death
+Using .numpy() in dequant detaches the tensor from autograd. Gradients return None silently.
+Use pure torch ops throughout quant.py. test_grad_flow.py catches this.
+🔴 High
+VRAM spike
+Dequanting per forward pass creates a full-precision weight temporarily. With gradient checkpointing it happens twice per layer.
+Measure and document honestly. Do not claim better VRAM than fp16 until profiled.
+🔴 High
+Accidental requires_grad
+If quantized_data touches the grad graph, PyTorch stores full model gradients. Immediate OOM.
+Assert trainable param count before training. test_grad_flow.py catches this.
+🟡 Medium
+Wrong name mapping
+Tensor loads into wrong layer position. Model trains without erroring but learns nothing.
+test_naming.py against a real GGUF. Zero tolerance for unmapped tensors.
+🟡 Medium
+Mixed precision tensors
+Norms and embeddings in GGUF are plain fp32, not quantized. Loader must handle both.
+Detect quant_type per tensor in loader.py. Handle non-quantized as regular Parameters.
+🟡 Medium
+GGUF LoRA output spec
+llama.cpp expects specific metadata keys and tensor naming. Wrong output loads silently but does nothing.
+Read llama-lora.cpp before writing writer.py. Test output in llama.cpp before calling done.
+🟢 Low
+K-quant complexity
+Q4_K_M uses superblocks with mixed precision. Dequant is not a simple scalar multiply.
+Hard NotImplementedError in quant.py with clear message. Do not attempt in v0.1.
+
+Honest VRAM Expectations
+Be clear-eyed about this before writing the README. Our value proposition is not beating bitsandbytes on VRAM — it is training from a GGUF you already have, without conversion, and outputting something llama.cpp runs directly.
+
+Setup
+Estimated VRAM (7B model)
+Full fp16 HuggingFace load
+~14 GB
+bitsandbytes QLoRA (4-bit)
+~5 GB
+gguf-lora Q8_0 lazy dequant (v0.1)
+~8–10 GB (estimated)
+gguf-lora Q4 if implemented later
+~5–6 GB (estimated)
+
+Build Order
+Build in this order. Each step has a clear definition of done before moving to the next.
+
+Step
+File / Action
+Definition of Done
+1
+test_grad_flow.py
+Write and pass before touching anything else. If this fails, stop.
+2
+quant.py
+Q8_0 dequant only. Round-trip error confirmed small.
+3
+test_quant.py
+Roundtrip error below threshold. Output type confirmed plain tensor.
+4
+naming.py
+Llama/Mistral map only. No guessing other architectures.
+5
+test_naming.py
+Verified against a real GGUF file. Zero unmapped tensors.
+6
+loader.py
+Assemble a model you can run a forward pass through.
+7
+lora.py
+Inject adapters. Confirm frozen/trainable split is exactly right.
+8
+writer.py
+Output GGUF LoRA. Verify it loads and runs in llama.cpp.
+9
+train.py
+Wire everything together. Train on a tiny dataset. Loss goes down.
+10
+README.md
+Document known limitations honestly. List supported quant types.
+
+The Upstream Path
+The long-term home for this work is huggingface/transformers as a GGUFQuantizer class sitting alongside BitsAndBytesQuantizer. Getting there is a multi-step process.
+    • v0.1: Standalone repo. Prove it works. Build real-world evidence.
+    • v0.2: Benchmark results, broader quant support, second architecture.
+    • PR: Open a pull request to transformers with working code, tests, and profiling data behind it. Reference issue #40070 and the woct0rdho prior art transparently.
+Starting as a standalone package is the right call. A PR to a major library requires their review standards, design approval, and full test coverage. Ship first, contribute upstream from a position of demonstrated proof.
+
+Final note
+Minimal and shippable is the mandate. The moment the complexity budget starts inflating — extra modules, extra args, extra abstraction — stop and ask whether it belongs in v0.1 or v0.2. A working, honest, well-documented tool with four CLI arguments is worth more than an ambitious half-finished framework. Ship the simple thing first.
+Minimal and shippable is the mandate. The moment the complexity budget starts inflating — extra modules, extra args, extra abstraction — stop and ask whether it belongs in v0.1 or v0.2. A working, honest, well-documented tool with four CLI arguments is worth more than an ambitious half-finished framework. Ship the simple thing first.

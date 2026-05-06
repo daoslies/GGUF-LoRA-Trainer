@@ -1,0 +1,222 @@
+
+gguf-lora
+Milestone Sign-Off & Final Phase Guidance
+To: Implementation Team — Internal Memo
+
+Milestone Sign-Off
+13 tests passing against real Qwen3-4B Q8_0 data. Buffer warnings resolved. Registry pattern in place. Gradient flow confirmed on real tensors. The foundational milestone is complete and signed off.
+What the team has built is not a toy — it is a working stack from raw GGUF bytes to differentiable LoRA layers, tested against a real 4B model. That is the hard part. writer.py and train.py are primarily assembly work at this point.
+
+What is genuinely done
+Q8_0 dequantization — correct, fast, mmap-safe
+Architecture registry — modular, auto-detecting, extensible
+Loader — distinguishes quantized vs F32, builds correct nn.Module objects
+LoRA injection — LazyGGUFLinear, LoRAGGUFLinear, inject_lora all working
+Gradient flow — confirmed on real tensors, base weights frozen, only lora_A/B trainable
+
+The One Thing That Can Silently Sink the Project
+Before writer.py is written, the team must read llama.cpp source. Specifically these two files:
+
+    • src/llama-lora.cpp
+    • tests/test-lora.cpp
+
+The GGUF LoRA output format is not well documented anywhere except in the llama.cpp source itself. If the output file is structurally wrong — wrong metadata keys, wrong tensor naming convention, missing fields — llama.cpp will load it without erroring and silently apply nothing. There is no crash, no warning, just a model that behaves identically to the base model. That is the hardest possible failure mode to debug.
+
+The silent failure risk
+llama.cpp's --lora flag loads the adapter file and applies it at inference time.
+If metadata keys are missing or tensor names are in HF convention rather than GGUF convention, the adapter loads but contributes zero to the output.
+The only way to detect this is to run a generation test and verify the output has actually changed after fine-tuning.
+Read the source before writing a single line of writer.py. This is not optional.
+
+writer.py: What to Build
+The required GGUF LoRA metadata keys
+These must be present in the output file or llama.cpp will not apply the adapter correctly:
+
+Metadata key
+Value / source
+general.type
+"adapter"
+general.architecture
+"qwen3" — from the source model
+adapter.type
+"lora"
+adapter.lora.r
+The rank integer used during training
+adapter.lora.alpha
+The alpha float used during training
+
+These key names are read directly from llama-lora.cpp. Verify them against the source before hardcoding — llama.cpp moves fast and these may have changed since documentation was last written.
+
+Tensor naming in the output
+LoRA tensors in the output file must use GGUF naming convention, not HF naming. The naming.py module already has the reverse mapping — use it. For each trained layer:
+
+# lora_A tensor
+blk.{i}.attn_q.weight.lora_a    # not model.layers.{i}.self_attn.q_proj.lora_A
+
+# lora_B tensor
+blk.{i}.attn_q.weight.lora_b
+
+The suffix convention (.lora_a / .lora_b) should be verified against llama.cpp source. Do not assume it.
+
+The minimal writer.py structure
+
+def save_lora_gguf(modules, name_map, output_path, rank, alpha, arch_id):
+    lora_tensors = {}
+    for hf_name, module in modules.items():
+        if not isinstance(module, LoRAGGUFLinear):
+            continue
+        gguf_name = name_map.hf_to_gguf(hf_name)  # reverse mapping
+        lora_tensors[gguf_name + '.lora_a'] = module.lora_A.detach().cpu()
+        lora_tensors[gguf_name + '.lora_b'] = module.lora_B.detach().cpu()
+
+    write_gguf_file(output_path, lora_tensors, metadata={
+        "general.type": "adapter",
+        "general.architecture": arch_id,
+        "adapter.type": "lora",
+        "adapter.lora.r": rank,
+        "adapter.lora.alpha": alpha,
+    })
+
+Note that naming.py currently has a one-way map (GGUF to HF). It needs a reverse lookup (HF to GGUF) for writer.py. This is straightforward — invert the dict — but it needs to be added explicitly and tested.
+
+train.py: What to Build
+Keep it minimal
+train.py should do exactly five things and nothing else:
+
+    • Parse four CLI arguments: --model, --data, --rank, --output
+    • Load the GGUF and inject LoRA via the loader
+    • Load training data from a .jsonl file — one text sample per line, tokenize with the model's tokenizer
+    • Run the training loop
+    • Save via writer.py
+
+The training loop
+
+optimizer = AdamW(
+    [p for p in model.parameters() if p.requires_grad],
+    lr=args.lr
+)
+
+# Assertion before training — catches accidental requires_grad leaks
+trainable = [p for p in model.parameters() if p.requires_grad]
+n_lora_layers = sum(1 for m in modules.values() if isinstance(m, LoRAGGUFLinear))
+assert len(trainable) == n_lora_layers * 2, \
+    f"Expected {n_lora_layers * 2} trainable params, got {len(trainable)}"
+
+for epoch in range(args.epochs):
+    for batch in dataloader:
+        outputs = model(**batch)
+        outputs.loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+
+The assertion before the loop is not optional. If any base weight has accidentally acquired requires_grad=True, the assertion catches it immediately with a clear message rather than letting it silently OOM mid-training.
+
+What train.py does NOT include in v0.1
+No scheduler, no gradient clipping, no wandb, no mixed precision, no checkpoint resuming, no multi-GPU. All of these are v0.2. Resist the temptation to add them now — they each add surface area for bugs and none of them are required to demonstrate that the pipeline works.
+
+The End-to-End Validation Test
+Once writer.py is implemented, the final test is not a unit test. It is a generation test run in llama.cpp:
+
+    • Fine-tune on 50-100 examples of a simple, distinctive pattern — something the base model does not do by default
+    • Save the GGUF LoRA via writer.py
+    • Run: llama-cli --model base.gguf --lora output.gguf --prompt [test prompt]
+    • Verify the output reflects the training data
+    • Run again WITHOUT --lora and verify the output does NOT reflect it
+
+This is the test that proves the whole project works. A unit test can only verify structure. This verifies meaning. Do not call v0.1 shipped until this passes.
+
+README Before Ship
+The README must be honest about limitations before the repo goes public. At minimum it must state:
+
+    • Supported quant types: Q8_0 only. Q4_K_M and other K-quants are not supported in v0.1.
+    • Supported architectures: Qwen3 only. Llama, Mistral, and others are not yet in the registry.
+    • VRAM: this does not beat bitsandbytes QLoRA. State the actual measured VRAM usage.
+    • Output: the GGUF LoRA is designed for llama.cpp inference. It is not a HuggingFace PEFT adapter.
+
+Honest limitations in a README build more trust than hiding them. The project is genuinely novel — it does not need to oversell.
+
+The finish line
+writer.py, train.py, the end-to-end generation test, and an honest README. That is everything between here and a shipped v0.1.
+Read llama-lora.cpp before writing writer.py. Run the generation test before calling it done. Everything else is in your hands — the hard work is already behind you.
+Read llama-lora.cpp before writing writer.py. Run the generation test before calling it done. Everything else is in your hands — the hard work is already behind you.
+
+
+
+
+----
+
+
+Got the actual source. This is exactly what the team needs. Here's what it tells us directly:
+
+The Definitive writer.py Reference
+The source resolves all the guesswork from the previous letter. Here are the exact facts pulled from the current llama.cpp codebase:
+Metadata — the exact calls to make
+python# From set_type() — line 374-376
+gguf_writer.add_type(gguf.GGUFType.ADAPTER)           # sets general.type = "adapter"
+gguf_writer.add_string(gguf.Keys.Adapter.TYPE, "lora") # sets adapter.type = "lora"
+
+# From set_gguf_parameters() — line 379-380
+gguf_writer.add_float32(gguf.Keys.Adapter.LORA_ALPHA, lora_alpha)  # note: float32, not int
+Three things to note from this:
+
+LORA_ALPHA is written as float32, not an integer. The previous letter said int — this corrects it.
+There is no adapter.lora.r rank key written by llama.cpp's own converter. Rank is implicit from the tensor shapes, not stored as metadata.
+general.type is set via add_type() using the enum GGUFType.ADAPTER, not a raw string write.
+
+Tensor naming — confirmed from lines 472-473
+pythonyield (dest_name + ".lora_a", lora_a)   # lowercase .lora_a
+yield (dest_name + ".lora_b", lora_b)   # lowercase .lora_b
+```
+
+So the suffix is `.lora_a` and `.lora_b` — lowercase, no underscore prefix. And `dest_name` is the GGUF tensor name, e.g.:
+```
+blk.0.attn_q.weight.lora_a
+blk.0.attn_q.weight.lora_b
+Tensor pairing — lines 432-446
+The converter pairs lora_A and lora_B before writing. They must be written as a matched pair per layer. If one is missing the assert fails. This means writer.py should validate that both matrices exist for every injected layer before writing.
+One critical detail — line 469-471, the token embedding transpose
+pythonif "token_embd.weight" in dest_name:
+    lora_a = lora_a.T   # lora_A is transposed for embeddings only
+We're not targeting token_embd in v0.1 so this doesn't apply immediately, but it's worth knowing for future.
+
+The Minimal writer.py — corrected version
+pythonimport gguf
+import torch
+from gguf_lora.lora import LoRAGGUFLinear
+
+def save_lora_gguf(modules, name_map, output_path, alpha, arch_id):
+    writer = gguf.GGUFWriter(output_path, arch=arch_id)
+
+    # Required metadata — exact calls from llama.cpp source
+    writer.add_type(gguf.GGUFType.ADAPTER)
+    writer.add_string(gguf.Keys.Adapter.TYPE, "lora")
+    writer.add_float32(gguf.Keys.Adapter.LORA_ALPHA, float(alpha))  # must be float32
+
+    for hf_name, module in modules.items():
+        if not isinstance(module, LoRAGGUFLinear):
+            continue
+
+        gguf_name = name_map.hf_to_gguf(hf_name)
+        if gguf_name is None:
+            raise ValueError(f"No reverse mapping for {hf_name}")
+
+        lora_a = module.lora_A.detach().cpu().float()
+        lora_b = module.lora_B.detach().cpu().float()
+
+        # Suffix is lowercase .lora_a / .lora_b — confirmed from source
+        writer.add_tensor(gguf_name + ".lora_a", lora_a.numpy())
+        writer.add_tensor(gguf_name + ".lora_b", lora_b.numpy())
+
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+
+What also needs to be added to naming.py
+The reverse mapping. Currently gguf_to_hf() exists, hf_to_gguf() does not. It's a simple dict inversion but it needs to be explicit and tested:
+python# In Qwen3NameMap
+def hf_to_gguf(self, hf_name: str) -> str | None:
+    # Build reverse map from QUANTIZED_TENSORS
+    # Parse layer index from hf_name, substitute back
+    ...
+This is the only new code needed in naming.py before writer.py can work. Send this to the team alongside the source extract and they have everything they need.
